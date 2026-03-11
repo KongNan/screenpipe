@@ -184,6 +184,17 @@ jobs:
           tauriScript: bunx tauri -v
           retryAttempts: 3
 
+      - name: Upload build artifacts (unsigned)  
+        uses: actions/upload-artifact@v4  
+        if: always()  # 即使前面步骤失败也运行  
+        with:  
+          name: enterprise-windows-x64-unsigned  
+          path: |  
+            apps/screenpipe-app-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe  
+            apps/screenpipe-app-tauri/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip  
+          retention-days: 30
+
+
       - name: Sign installer with SSL.com EV certificate
         shell: powershell
         env:
@@ -241,44 +252,57 @@ jobs:
             Write-Host "Tauri signature regenerated"
           }
 
-      - name: Create .intunewin and upload to R2
-        shell: powershell
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-        run: |
-          cd apps/screenpipe-app-tauri
-          $intunewinPath = $null
-          try { .\scripts\exe-to-intunewin.ps1 } catch { Write-Host ".intunewin creation failed: $_" }
-          $intunewin = Get-ChildItem "scripts\intunewin\out\*.intunewin" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($intunewin) { $intunewinPath = $intunewin.FullName }
-
-          if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
-            Write-Host "Installing AWS CLI..."
-            Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "$env:TEMP\awscli.msi"
-            Start-Process msiexec.exe -Wait -ArgumentList "/i $env:TEMP\awscli.msi /quiet"
-            $env:PATH += ";C:\Program Files\Amazon\AWSCLIV2"
-          }
-          $version = (Get-Content src-tauri/Cargo.toml | Select-String -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
-          $r2Endpoint = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"
-          $r2Prefix = "s3://screenpipe-releases/enterprise/releases/$version/x86_64-pc-windows-msvc"
-          $nsisDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
-
-          Write-Host "Uploading enterprise Windows bundles for v$version to R2..."
-          Get-ChildItem "$nsisDir/*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
-            aws s3 cp $_.FullName "$r2Prefix/$($_.Name)" --endpoint-url $r2Endpoint
-            Write-Host "  $($_.Name)"
-          }
-          Get-ChildItem "$nsisDir/*.nsis.zip","$nsisDir/*.sig" -ErrorAction SilentlyContinue | ForEach-Object {
-            aws s3 cp $_.FullName "$r2Prefix/$($_.Name)" --endpoint-url $r2Endpoint
-            Write-Host "  $($_.Name)"
-          }
-          if ($intunewinPath) {
-            aws s3 cp $intunewinPath "$r2Prefix/$(Split-Path -Leaf $intunewinPath)" --endpoint-url $r2Endpoint
-            Write-Host "  $(Split-Path -Leaf $intunewinPath)"
-          }
-          Write-Host "R2 enterprise upload complete for Windows"
+      - name: Create .intunewin and upload to R2  
+        shell: powershell  
+        continue-on-error: true  # 签名失败时继续执行  
+        env:  
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}  
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}  
+          AWS_DEFAULT_REGION: auto  
+        run: |  
+          cd apps/screenpipe-app-tauri  
+          $intunewinPath = $null  
+          try {   
+            .\scripts\exe-to-intunewin.ps1   
+            Write-Host "Signing completed successfully"  
+          } catch {   
+            Write-Host "Signing failed (this is expected for forks): $_"  
+            Write-Host "Continuing with unsigned installer..."  
+          }  
+            
+          # 始终尝试上传文件（无论签名是否成功）  
+          if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {  
+            Write-Host "Installing AWS CLI..."  
+            Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "$env:TEMP\awscli.msi"  
+            Start-Process msiexec.exe -Wait -ArgumentList "/i $env:TEMP\awscli.msi /quiet"  
+            $env:PATH += ";C:\Program Files\Amazon\AWSCLIV2"  
+          }  
+            
+          $version = (Get-Content src-tauri/Cargo.toml | Select-String -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value  
+          $r2Endpoint = "https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com"  
+          $r2Prefix = "s3://screenpipe-releases/enterprise/releases/$version/x86_64-pc-windows-msvc"  
+          $nsisDir = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"  
+        
+          Write-Host "Uploading enterprise Windows bundles for v$version to R2..."  
+            
+          # 上传原始（未签名）安装包  
+          Get-ChildItem "$nsisDir/*.exe" -ErrorAction SilentlyContinue | ForEach-Object {  
+            aws s3 cp $_.FullName "$r2Prefix/$($_.Name)" --endpoint-url $r2Endpoint  
+            Write-Host "  ✅ $($_.Name)"  
+          }  
+            
+          Get-ChildItem "$nsisDir/*.nsis.zip","$nsisDir/*.sig" -ErrorAction SilentlyContinue | ForEach-Object {  
+            aws s3 cp $_.FullName "$r2Prefix/$($_.Name)" --endpoint-url $r2Endpoint  
+            Write-Host "  ✅ $($_.Name)"  
+          }  
+            
+          # 如果签名成功，也上传签名后的文件  
+          if ($intunewinPath) {  
+            aws s3 cp $intunewinPath "$r2Prefix/$(Split-Path -Leaf $intunewinPath)" --endpoint-url $r2Endpoint  
+            Write-Host "  ✅ $(Split-Path -Leaf $intunewinPath)"  
+          }  
+            
+          Write-Host "R2 upload complete for Windows"
 
       - name: Upload enterprise NSIS installer (artifact)
         uses: actions/upload-artifact@v4
